@@ -9,14 +9,9 @@ import {
 const TABLE = "sensor_data";
 
 /**
- * Fetch the latest row that looks like an ESP32-A (environmental) reading
- * and the latest row that looks like an ESP32-B (weather) reading, then
- * combine them at the application layer. We deliberately do NOT join on
- * reading_slot, because ESP32-A currently never sets it (see types.ts).
- *
- * If a future firmware update makes both boards write reading_slot, both
- * rows will naturally share the same reading_slot and isTrulyCombined
- * will reflect that.
+ * Fetch the latest temperature/humidity row and the latest weather row
+ * (wind + lightning), then combine them at the application layer. With the
+ * single-ESP32 firmware both normally resolve to the same row.
  */
 export async function fetchCombinedLatestReading(): Promise<CombinedReading> {
   const supabase = getSupabaseClient();
@@ -32,7 +27,9 @@ export async function fetchCombinedLatestReading(): Promise<CombinedReading> {
     supabase
       .from(TABLE)
       .select("*")
-      .not("pressure", "is", null)
+      // Every current firmware row carries the Xweather fields, wind and
+      // reading_slot. (Pressure is no longer sent, so it must not be used.)
+      .not("xweather_reading_type", "is", null)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle(),
@@ -195,19 +192,35 @@ export interface DayRow {
   temperature: number | null;
   humidity: number | null;
   wind_speed: number | null;
+  wind_direction: number | null;
+  xweather_lightning: boolean | null;
+  xweather_reading_type: string | null;
+  xweather_lightning_distance_km: number | null;
 }
 
-/** All rows from the last `hours` hours (oldest first), only the columns the
- * dashboard's trend chart and gust need. */
-export async function fetchLastHours(hours = 24, limit = 3000): Promise<DayRow[]> {
+const DAY_COLUMNS =
+  "created_at, temperature, humidity, wind_speed, wind_direction, xweather_lightning, xweather_reading_type, xweather_lightning_distance_km";
+// Supabase/PostgREST returns at most 1000 rows per request, and the firmware
+// writes one row per 15 s (~5760 / day), so the window is fetched in pages.
+const PAGE_SIZE = 1000;
+
+/** All rows from the last `hours` hours (oldest first). */
+export async function fetchLastHours(hours = 24, maxRows = 8000): Promise<DayRow[]> {
   const supabase = getSupabaseClient();
   const since = new Date(Date.now() - hours * 3600_000).toISOString();
-  const { data, error } = await supabase
-    .from(TABLE)
-    .select("created_at, temperature, humidity, wind_speed")
-    .gte("created_at", since)
-    .order("created_at", { ascending: true })
-    .limit(limit);
-  if (error) throw error;
-  return (data ?? []) as DayRow[];
+  const out: DayRow[] = [];
+  for (let from = 0; from < maxRows; from += PAGE_SIZE) {
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select(DAY_COLUMNS)
+      .gte("created_at", since)
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true })
+      .range(from, from + PAGE_SIZE - 1);
+    if (error) throw error;
+    const page = (data ?? []) as DayRow[];
+    out.push(...page);
+    if (page.length < PAGE_SIZE) break;
+  }
+  return out;
 }
